@@ -13,7 +13,8 @@
 static dev_t first; 			// Global variable for the first device number
 static struct cdev c_dev; 		// Global variable for the character device structure
 static struct class *cl;	 	// Global variable for the device class
-static DECLARE_WAIT_QUEUE_HEAD(queueForWait);
+static DECLARE_WAIT_QUEUE_HEAD(queueForRead);
+static DECLARE_WAIT_QUEUE_HEAD(queueForWrite);
 
 //---------------------------------------------------------------------------
 static int sizeOfBuffer = 20;	            // parametric size of the buffer
@@ -78,21 +79,18 @@ static ssize_t my_read(struct file *f,		// path to the device
         return countOfReadedBytes;          // stop work cause the buffer is empty
     } else {
 	    while (countOfReadedBytes != len) {
-		    if (isBufferEmpty()) {
-                //while (isBufferEmpty()) {}	        // if the buffer is empty go sleep
-		    	wait_event_interruptible(queueForWait, !isBufferEmpty());
-                /*copy_to_user(buf, blockOfKernelMemory, countOfReadedBytes);
-                readMutex = true;
-                kfree(blockOfKernelMemory);
-                return countOfReadedBytes; */
+		    if (isBufferEmpty()) {          // if the buffer is empty go sleep
+		    	wait_event_interruptible(queueForRead, !isBufferEmpty());
 		    }
             blockOfKernelMemory[countOfReadedBytes] = driverBuffer[readPos];
+            printk(KERN_INFO "buffer: read(wrPos: %d, readPos: %d)\n", writePos, readPos);
             countOfReadedBytes++;
 		    if (readPos == sizeOfBuffer - 1) {
                 readPos = 0;
             } else {
                 readPos++;
             }
+            wake_up_interruptible(&queueForWrite);
         }
         copy_to_user(buf, blockOfKernelMemory, countOfReadedBytes);
         kfree(blockOfKernelMemory);
@@ -131,26 +129,17 @@ static ssize_t my_write(struct file *f,		// path to the device
         copy_from_user(blockOfKernelMemory, buf, len);
         while (countOfWrittenBytes != len) {
             if (isBufferFull()) {
-              /*  writeMutex = true;
-                kfree(blockOfKernelMemory);
-		        return countOfWrittenBytes;*/
-                wait_event_interruptible(queueForWait, !isBufferFull());
+                wait_event_interruptible(queueForWrite, !isBufferFull());
             }
-            //*writingPointer = blockOfKernelMemory[countOfWrittenBytes];
+            printk(KERN_INFO "buffer: write(wrPos: %d, readPos: %d)\n", writePos, readPos);
             driverBuffer[writePos] = blockOfKernelMemory[countOfWrittenBytes];
             countOfWrittenBytes++;
-            /*if (writingPointer == &driverBuffer[sizeOfBuffer - 1]) {
-                writingPointer = &driverBuffer[0];
-                writePos = 0;
-            } else {
-                writingPointer += sizeof(char);
-                writePos++;
-            }*/
             if (writePos == sizeOfBuffer - 1) {
                 writePos = 0;
             } else {
                 writePos++;
             }
+            wake_up_interruptible(&queueForRead);
         }
         kfree(blockOfKernelMemory);
         writeMutex = true;
@@ -172,8 +161,6 @@ static ssize_t my_write(struct file *f,		// path to the device
 
 static int __init envelore_init(void) /* Constructor */
 {
-    //DECLARE_WAIT_QUEUE_HEAD(queueForWait);
-    //init_waitqueue_head(queueForWait);
    if (alloc_chrdev_region(&first, 0, 1, "enveloredevice") < 0)
     {
         pr_alert("first cond fail :( ");
