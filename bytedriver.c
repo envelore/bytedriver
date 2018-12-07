@@ -9,6 +9,7 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/slab.h>
+#include <linux/cred.h>
 
 static dev_t first; 			// Global variable for the first device number
 static struct cdev c_dev; 		// Global variable for the character device structure
@@ -20,13 +21,57 @@ static DECLARE_WAIT_QUEUE_HEAD(queueForWrite);
 static int sizeOfBuffer = 20;	            // parametric size of the buffer
 module_param(sizeOfBuffer, int, 0); 
 
+struct buffer {
+    char* memory;
+    int writePosition;
+    int readPosition;
+    bool readingMutex;
+    bool writingMutex;
+    uid_t user;
+    struct buffer* next;
+} initBuffer;
+
+static struct buffer* addNewBuffer(void) {
+    struct buffer* newBuffer = (struct buffer*)kcalloc(1, sizeof(struct buffer), GFP_KERNEL);
+    if (newBuffer == NULL) {
+        return NULL;
+    }
+    newBuffer->memory = (char*)kcalloc(sizeOfBuffer, sizeof(char), GFP_KERNEL);
+    if (newBuffer->memory == NULL) {
+        kfree(newBuffer);
+        return NULL;
+    }
+    newBuffer->writePosition = 0;
+    newBuffer->readPosition = 0;
+    newBuffer->writingMutex = true;
+    newBuffer->readingMutex = true;
+    newBuffer->user = current_uid().val;
+    
+    struct buffer* i = &initBuffer;
+     while (i->next != NULL) {
+        i = i->next;
+    }
+    i->next = newBuffer;
+
+    return newBuffer;
+}
+
+static struct buffer* searchBufferByID(uid_t searchID) {
+    struct buffer* result = initBuffer.next;
+    if (initBuffer.user == searchID)
+        return &initBuffer;
+    while ((result != NULL) || (result->user != searchID)) {
+        result = result->next;
+    }
+    return result;
+}
+
 static char* driverBuffer;	                        // the buffer
-static char* writingPointer;	        // a pointer for writing into the buffer
-static char* readingPointer;	        // a pointer for reading from the buffer
 static int writePos = 0;
 static int readPos = 0;
 static bool readMutex = true;
 static bool writeMutex = true;
+static uid_t currentUser;
 //---------------------------------------------------------------------------
  static bool isBufferEmpty(void) {
     if (readPos == writePos)
@@ -44,8 +89,41 @@ static bool isBufferFull(void) {
         return false;
 }
 //----------------------------------------------------------------------------
+static void exportBufferImage(struct buffer* image)
+{
+    image->memory = driverBuffer;
+    image->writePosition = writePos;
+    image->readPosition = readPos;
+    image->writingMutex = writeMutex;
+    image->readingMutex = readMutex;
+    image->user = current_uid().val;
+}
+
+static void importBufferImage(struct buffer* image)
+{
+    driverBuffer = image->memory;
+    writePos = image->writePosition;
+    readPos = image->readPosition;
+    writeMutex = image->writingMutex;
+    readMutex = image->readingMutex;
+    currentUser = image->user;
+}
+
+//----------------------------------------------------------------------------
 static int my_open(struct inode *i, struct file *f) {
-	printk(KERN_INFO "Driver: open(wrPos: %d, readPos: %d)\n", writePos, readPos);
+    if (current_uid().val != currentUser) {
+        if (readMutex && writeMutex == true) {
+            exportBufferImage(currentUser);
+            if (searchBufferByID(current_uid().val) == NULL) {
+                importBufferImage(addNewBuffer());
+            } else {
+                importBufferImage(current_uid().val);
+            }
+        } else {
+            return -1;
+        }
+    }
+	printk(KERN_INFO "Driver: open(wr: %d, rd: %d, uid: %d)\n", writePos, readPos, current_uid().val);
   	return 0;
 }
 
@@ -60,9 +138,9 @@ static ssize_t my_read(struct file *f,		// path to the device
 						loff_t *off)		// ??????
 {
     ssize_t countOfReadedBytes = 0;
-   /* if (!readMutex) {                       // checking that no another process are using the buffer
+    if (!readMutex) {                     // checking that no another process are using the buffer
         return 0;
-    }*/
+    }
     readMutex = false;
     countOfReadedBytes = 0;
 	printk(KERN_INFO "Driver: read(length: %ld)\n", len);
@@ -146,6 +224,8 @@ static ssize_t my_write(struct file *f,		// path to the device
         return countOfWrittenBytes;
 	}
 }
+//------------------------------------------------------------------------------
+
 
 
 //------------------------------------------------------------------------------
@@ -195,9 +275,10 @@ static int __init envelore_init(void) /* Constructor */
     if (driverBuffer == NULL) {
         pr_err("MEMORY KCALLOC PROBLEMZ");
     }
+    currentUser = current_uid().val;
+    exportBufferImage(&initBuffer);
+    initBuffer.next = NULL;
 
-    writingPointer = driverBuffer;
-    readingPointer = driverBuffer;
     pr_alert("ENVELORE: Driver started.\n");
     return 0;
 }
