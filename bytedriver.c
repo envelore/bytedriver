@@ -18,7 +18,7 @@ static DECLARE_WAIT_QUEUE_HEAD(queueForWrite);
 
 //---------------------------------------------------------------------------
 static int sizeOfBuffer = 20;	            // parametric size of the buffer
-//module_param(sizeOfBuffer, int, 0); 
+module_param(sizeOfBuffer, int, 0); 
 
 static char* driverBuffer;	                        // the buffer
 static char* writingPointer;	        // a pointer for writing into the buffer
