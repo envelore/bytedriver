@@ -10,6 +10,8 @@
 #include <linux/wait.h>
 #include <linux/slab.h>
 #include <linux/cred.h>
+#include <linux/mutex.h>
+//#include <linux/syscalls.h>
 
 static dev_t first; 			// Global variable for the first device number
 static struct cdev c_dev; 		// Global variable for the character device structure
@@ -25,70 +27,80 @@ struct buffer {
     char* memory;
     int writePosition;
     int readPosition;
-    bool readingMutex;
-    bool writingMutex;
+   	struct mutex* readingMutex;
+    struct mutex* writingMutex;
     uid_t user;
     struct buffer* next;
-} initBuffer;
+};
 
-static struct buffer* addNewBuffer(void) {
+static struct buffer* fisrtBuffer = NULL;
+
+static void addNewBuffer(void) {
     struct buffer* newBuffer = (struct buffer*)kcalloc(1, sizeof(struct buffer), GFP_KERNEL);
     if (newBuffer == NULL) {
-        return NULL;
+        pr_info("addNewBuffer(): havn't got memory for buffer");
     }
     newBuffer->memory = (char*)kcalloc(sizeOfBuffer, sizeof(char), GFP_KERNEL);
     if (newBuffer->memory == NULL) {
         kfree(newBuffer);
-        return NULL;
+        pr_info("addNewBuffer(): havn't got memory for buffer memory");
     }
     newBuffer->writePosition = 0;
     newBuffer->readPosition = 0;
-    newBuffer->writingMutex = true;
-    newBuffer->readingMutex = true;
+    DEFINE_MUTEX(read_lock);
+    DEFINE_MUTEX(write_lock);
+    newBuffer->writingMutex = &write_lock;
+    newBuffer->readingMutex = &read_lock;
     newBuffer->user = current_uid().val;
     
-    struct buffer* i = &initBuffer;
-     while (i->next != NULL) {
-        i = i->next;
+    struct buffer* i = fisrtBuffer;
+    if (i != NULL) {
+        while (i->next != NULL) {
+            i = i->next;
+        }
+        i->next = newBuffer;
+    } else {
+        fisrtBuffer = newBuffer;
+        pr_info("Now firstBuffer pointer is %s equal NULL", (fisrtBuffer == NULL)?"":"NOT");
+        pr_info("BTW, newBuffer is %s equal NULL", (newBuffer == NULL)?"":"NOT");
     }
-    i->next = newBuffer;
-
-    return newBuffer;
+    pr_info("addNewBuffer(): new buffer for user id:%d has been created", newBuffer->user);
 }
 
 static struct buffer* searchBufferByID(uid_t searchID) {
-    struct buffer* result = initBuffer.next;
-    if (initBuffer.user == searchID)
-        return &initBuffer;
-    while ((result != NULL) || (result->user != searchID)) {
-        result = result->next;
+    struct buffer* result = fisrtBuffer;
+    pr_info("searchBufferByID(%d): searching buffer for userID:%d...", searchID, searchID);
+    if (result != NULL) {
+        while (result != NULL) {
+            pr_info("searchBufferByID(%d): i see buffer for userID:%d", searchID, result->user);
+            if (result->user == searchID)
+                return result;
+            else 
+                result = result->next;
+        }
+        return result;
+    } else {
+        return result;
     }
-    return result;
 }
 
-static char* driverBuffer;	                        // the buffer
-static int writePos = 0;
-static int readPos = 0;
-static bool readMutex = true;
-static bool writeMutex = true;
-static uid_t currentUser;
 //---------------------------------------------------------------------------
- static bool isBufferEmpty(void) {
-    if (readPos == writePos)
+ static bool isBufferEmpty(struct buffer* buf) {
+    if (buf->readPosition == buf->writePosition)
         return true;
     else
         return false;
 }
 
-static bool isBufferFull(void) {
-    if ((writePos == readPos - 1) ||
-        ((writePos == sizeOfBuffer - 1) &&
-         (readPos == 0)))
+static bool isBufferFull(struct buffer* buf) {
+    if ((buf->writePosition == buf->readPosition - 1) ||
+        ((buf->writePosition == sizeOfBuffer - 1) &&
+         (buf->readPosition == 0)))
         return true;
     else
         return false;
 }
-//----------------------------------------------------------------------------
+/*----------------------------------------------------------------------------
 static void exportBufferImage(struct buffer* image)
 {
     image->memory = driverBuffer;
@@ -108,27 +120,20 @@ static void importBufferImage(struct buffer* image)
     readMutex = image->readingMutex;
     currentUser = image->user;
 }
-
-//----------------------------------------------------------------------------
+----------------------------------------------------------------------------*/
 static int my_open(struct inode *i, struct file *f) {
-    if (current_uid().val != currentUser) {
-        if (readMutex && writeMutex == true) {
-            exportBufferImage(currentUser);
-            if (searchBufferByID(current_uid().val) == NULL) {
-                importBufferImage(addNewBuffer());
-            } else {
-                importBufferImage(current_uid().val);
-            }
-        } else {
-            return -1;
-        }
+    uid_t user = current_uid().val;
+    if (searchBufferByID(user) == NULL) {
+        pr_info("searchByID(%d): havn't found user's buffer", user);
+        addNewBuffer();
     }
-	printk(KERN_INFO "Driver: open(wr: %d, rd: %d, uid: %d)\n", writePos, readPos, current_uid().val);
+
+	printk(KERN_INFO "Driver: open(uid: %d)\n", current_uid().val);
   	return 0;
 }
 
 static int my_close(struct inode *i, struct file *f) {
-	printk(KERN_INFO "Driver: close(wrPos: %d, readPos: %d)\n", writePos, readPos);
+	printk(KERN_INFO "Driver: close(uid: %d)\n", current_uid().val);
   	return 0;
 }
 //----------------------------------------------------------------------------
@@ -138,41 +143,39 @@ static ssize_t my_read(struct file *f,		// path to the device
 						loff_t *off)		// ??????
 {
     ssize_t countOfReadedBytes = 0;
-    if (!readMutex) {                     // checking that no another process are using the buffer
+    struct buffer* currentBuffer = searchBufferByID(current_uid().val);
+    if (currentBuffer == NULL) {
+        printk(KERN_INFO "Read(): PROBLEMZ WITH BUFFER POINTER, EXITED, SIR");
         return 0;
     }
-    readMutex = false;
-    countOfReadedBytes = 0;
-	printk(KERN_INFO "Driver: read(length: %ld)\n", len);
+    //mutex_lock(currentBuffer->readingMutex);
+	printk(KERN_INFO "Driver: read(length: %ld, uid: %d)\n", len, current_uid().val);
     char* blockOfKernelMemory = (char*)kcalloc(len, sizeof(char), GFP_KERNEL);
     if (blockOfKernelMemory == NULL) {
-        printk(KERN_INFO "Error: it hadn't provided any memory.");
-        kfree(blockOfKernelMemory);
-        readMutex = true;
-        return -1;
+        goto readexit;
     }
-    if (isBufferEmpty()) {
-        readMutex = true;
-        kfree(blockOfKernelMemory);
-        return countOfReadedBytes;          // stop work cause the buffer is empty
+    if (isBufferEmpty(currentBuffer)) {
+        goto readexit;                      // stop work cause the buffer is empty
     } else {
 	    while (countOfReadedBytes != len) {
-		    if (isBufferEmpty()) {          // if the buffer is empty go sleep
-		    	wait_event_interruptible(queueForRead, !isBufferEmpty());
+		    if (isBufferEmpty(currentBuffer)) {          // if the buffer is empty go sleep
+		    	wait_event_interruptible(queueForRead, !isBufferEmpty(currentBuffer));
 		    }
-            blockOfKernelMemory[countOfReadedBytes] = driverBuffer[readPos];
-            printk(KERN_INFO "buffer: read(wrPos: %d, readPos: %d)\n", writePos, readPos);
+            blockOfKernelMemory[countOfReadedBytes] = currentBuffer->memory[currentBuffer->readPosition];
+            printk(KERN_INFO "buffer: read(wrPos: %d, readPos: %d)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition);
             countOfReadedBytes++;
-		    if (readPos == sizeOfBuffer - 1) {
-                readPos = 0;
+		    if (currentBuffer->readPosition == sizeOfBuffer - 1) {
+                currentBuffer->readPosition = 0;
             } else {
-                readPos++;
+                currentBuffer->readPosition++;
             }
             wake_up_interruptible(&queueForWrite);
         }
         copy_to_user(buf, blockOfKernelMemory, countOfReadedBytes);
-        kfree(blockOfKernelMemory);
-        readMutex = true;
+readexit:   kfree(blockOfKernelMemory);
+       // mutex_unlock(currentBuffer->readingMutex);
         return countOfReadedBytes;
     }
 }
@@ -183,44 +186,40 @@ static ssize_t my_write(struct file *f,		// path to the device
 						loff_t *off)		// ??????
 {
     ssize_t countOfWrittenBytes = 0;
-    if (driverBuffer == NULL) {
-        printk(KERN_ALERT "Driver writting: ISSUE FROM BUFFER");
+    struct buffer* currentBuffer = searchBufferByID(current_uid().val);
+    if (currentBuffer == NULL) {
+        printk(KERN_INFO "Write(): PROBLEMZ WITH BUFFER POINTER, EXITED, SIR");
         return 0;
     }
-	/*if (!writeMutex) {
-        return 0;
-    }*/
-    writeMutex = false;
-	printk(KERN_INFO "Driver: write(length: %ld)\n", len);
+   // mutex_lock(currentBuffer->writingMutex);
+	printk(KERN_INFO "Driver: write(length: %ld, uid: %d)\n", len, current_uid().val);
     char* blockOfKernelMemory = (char*)kcalloc(len, sizeof(char), GFP_KERNEL);
     if (blockOfKernelMemory == NULL) {
         printk(KERN_INFO "Error: it hadn't provided any memory.");
-        kfree(blockOfKernelMemory);
-        writeMutex = true;
-        return -1;
+        goto writeexit;
     }
-	if (isBufferFull()) {
-        writeMutex = true;
-        kfree(blockOfKernelMemory);
-		return countOfWrittenBytes;
+	if (isBufferFull(currentBuffer)) {
+        goto writeexit;
 	} else {
         copy_from_user(blockOfKernelMemory, buf, len);
         while (countOfWrittenBytes != len) {
-            if (isBufferFull()) {
-                wait_event_interruptible(queueForWrite, !isBufferFull());
+            if (isBufferFull(currentBuffer)) {
+                wait_event_interruptible(queueForWrite, !isBufferFull(currentBuffer));
             }
-            printk(KERN_INFO "buffer: write(wrPos: %d, readPos: %d)\n", writePos, readPos);
-            driverBuffer[writePos] = blockOfKernelMemory[countOfWrittenBytes];
+            printk(KERN_INFO "buffer: write(wrPos: %d, readPos: %d)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition);
+            currentBuffer->memory[currentBuffer->writePosition] = blockOfKernelMemory[countOfWrittenBytes];
             countOfWrittenBytes++;
-            if (writePos == sizeOfBuffer - 1) {
-                writePos = 0;
+            if (currentBuffer->writePosition == sizeOfBuffer - 1) {
+                currentBuffer->writePosition = 0;
             } else {
-                writePos++;
+                currentBuffer->writePosition++;
             }
             wake_up_interruptible(&queueForRead);
         }
-        kfree(blockOfKernelMemory);
-        writeMutex = true;
+writeexit:  kfree(blockOfKernelMemory);
+       // mutex_unlock(currentBuffer->writingMutex);
         return countOfWrittenBytes;
 	}
 }
@@ -243,44 +242,32 @@ static int __init envelore_init(void) /* Constructor */
 {
    if (alloc_chrdev_region(&first, 0, 1, "enveloredevice") < 0)
     {
-        pr_alert("first cond fail :( ");
-        return -1;
+        goto e0;
     } else {pr_info("alloc_chrdev_region - ok... ");}
     if (IS_ERR(cl = class_create(THIS_MODULE, "chardrv")))
     {
-        pr_alert("2nd cond fail :( ");
-        unregister_chrdev_region(first, 1);
-        return PTR_ERR(cl);
+        goto e1;
     } else {pr_info("class_create - ok... ");}
     if (device_create(cl, NULL, first, NULL, "envel") == NULL)
     {
-        pr_alert("3d cond fail :( ");
-        class_destroy(cl);
-        unregister_chrdev_region(first, 1);
-        return -1;
+        goto e2;
     }  else {pr_info("device_create - ok... ");}
     cdev_init(&c_dev, &pugs_fops);
     pr_info("cdev_init - ok... ");
     if (cdev_add(&c_dev, first, 1) == -1)
     {
-        pr_alert("4th cond fail :( ");
-        device_destroy(cl, first);
-        class_destroy(cl);
-        unregister_chrdev_region(first, 1);
-        return -1;
+        goto e3;
     }  else {
         pr_info("cdev_add - ok... ");
     }
-    driverBuffer = (char*)kcalloc(sizeOfBuffer, sizeof(char), GFP_KERNEL);
-    if (driverBuffer == NULL) {
-        pr_err("MEMORY KCALLOC PROBLEMZ");
-    }
-    currentUser = current_uid().val;
-    exportBufferImage(&initBuffer);
-    initBuffer.next = NULL;
-
+    //sys_chmod("/dev/envel", 0777);
     pr_alert("ENVELORE: Driver started.\n");
     return 0;
+
+e3: device_destroy(cl, first);
+e2: class_destroy(cl);
+e1: unregister_chrdev_region(first, 1);
+e0: return -1;
 }
 
 static void __exit envelore_exit(void) /* Destructor */
@@ -289,7 +276,14 @@ static void __exit envelore_exit(void) /* Destructor */
     device_destroy(cl, first);
     class_destroy(cl);
     unregister_chrdev_region(first, 1);
-    kfree(driverBuffer);
+    struct buffer* i = fisrtBuffer;
+    struct buffer* temp;
+    if (i != NULL) {
+        kfree(i->memory);
+        temp = i->next;
+        kfree(i);
+        i = temp;
+    }
     pr_alert("ENVELORE: Driver stoped");
 }
 
