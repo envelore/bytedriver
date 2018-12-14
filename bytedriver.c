@@ -11,7 +11,7 @@
 #include <linux/slab.h>
 #include <linux/cred.h>
 #include <linux/mutex.h>
-//#include <linux/syscalls.h>
+
 
 static dev_t first; 			// Global variable for the first device number
 static struct cdev c_dev; 		// Global variable for the character device structure
@@ -27,8 +27,8 @@ struct buffer {
     char* memory;
     int writePosition;
     int readPosition;
-   	struct mutex* readingMutex;
-    struct mutex* writingMutex;
+   	struct mutex readingMutex;
+    struct mutex writingMutex;
     uid_t user;
     struct buffer* next;
 };
@@ -47,10 +47,6 @@ static void addNewBuffer(void) {
     }
     newBuffer->writePosition = 0;
     newBuffer->readPosition = 0;
-    DEFINE_MUTEX(read_lock);
-    DEFINE_MUTEX(write_lock);
-    newBuffer->writingMutex = &write_lock;
-    newBuffer->readingMutex = &read_lock;
     newBuffer->user = current_uid().val;
     
     struct buffer* i = fisrtBuffer;
@@ -100,27 +96,8 @@ static bool isBufferFull(struct buffer* buf) {
     else
         return false;
 }
-/*----------------------------------------------------------------------------
-static void exportBufferImage(struct buffer* image)
-{
-    image->memory = driverBuffer;
-    image->writePosition = writePos;
-    image->readPosition = readPos;
-    image->writingMutex = writeMutex;
-    image->readingMutex = readMutex;
-    image->user = current_uid().val;
-}
+//----------------------------------------------------------------------------
 
-static void importBufferImage(struct buffer* image)
-{
-    driverBuffer = image->memory;
-    writePos = image->writePosition;
-    readPos = image->readPosition;
-    writeMutex = image->writingMutex;
-    readMutex = image->readingMutex;
-    currentUser = image->user;
-}
-----------------------------------------------------------------------------*/
 static int my_open(struct inode *i, struct file *f) {
     uid_t user = current_uid().val;
     if (searchBufferByID(user) == NULL) {
@@ -148,7 +125,7 @@ static ssize_t my_read(struct file *f,		// path to the device
         printk(KERN_INFO "Read(): PROBLEMZ WITH BUFFER POINTER, EXITED, SIR");
         return 0;
     }
-    //mutex_lock(currentBuffer->readingMutex);
+    mutex_lock(&currentBuffer->readingMutex);
 	printk(KERN_INFO "Driver: read(length: %ld, uid: %d)\n", len, current_uid().val);
     char* blockOfKernelMemory = (char*)kcalloc(len, sizeof(char), GFP_KERNEL);
     if (blockOfKernelMemory == NULL) {
@@ -175,7 +152,7 @@ static ssize_t my_read(struct file *f,		// path to the device
         }
         copy_to_user(buf, blockOfKernelMemory, countOfReadedBytes);
 readexit:   kfree(blockOfKernelMemory);
-       // mutex_unlock(currentBuffer->readingMutex);
+        mutex_unlock(&currentBuffer->readingMutex);
         return countOfReadedBytes;
     }
 }
@@ -191,7 +168,7 @@ static ssize_t my_write(struct file *f,		// path to the device
         printk(KERN_INFO "Write(): PROBLEMZ WITH BUFFER POINTER, EXITED, SIR");
         return 0;
     }
-   // mutex_lock(currentBuffer->writingMutex);
+    mutex_lock(&currentBuffer->writingMutex);
 	printk(KERN_INFO "Driver: write(length: %ld, uid: %d)\n", len, current_uid().val);
     char* blockOfKernelMemory = (char*)kcalloc(len, sizeof(char), GFP_KERNEL);
     if (blockOfKernelMemory == NULL) {
@@ -219,7 +196,7 @@ static ssize_t my_write(struct file *f,		// path to the device
             wake_up_interruptible(&queueForRead);
         }
 writeexit:  kfree(blockOfKernelMemory);
-       // mutex_unlock(currentBuffer->writingMutex);
+        mutex_unlock(&currentBuffer->writingMutex);
         return countOfWrittenBytes;
 	}
 }
@@ -291,5 +268,5 @@ static void __exit envelore_exit(void) /* Destructor */
 module_init(envelore_init);
 module_exit(envelore_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Vladimir Nuhtilin <envelore@yandex.ru>");
+MODULE_AUTHOR("Vladimir Nukhtilin <envelore@yandex.ru>");
 MODULE_DESCRIPTION("My First Character Driver");
