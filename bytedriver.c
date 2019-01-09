@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/cred.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 
 
 static dev_t first; 			// Global variable for the first device number
@@ -31,6 +32,9 @@ struct buffer {
     struct mutex writingMutex;
     uid_t user;
     struct buffer* next;
+    int countOfOpening;
+    spinlock_t* comparing;
+    bool alarm;
 };
 
 static struct buffer* fisrtBuffer = NULL;
@@ -45,10 +49,14 @@ static void addNewBuffer(void) {
         kfree(newBuffer);
         pr_info("addNewBuffer(): havn't got memory for buffer memory");
     }
+    newBuffer->comparing = (spinlock_t*)kcalloc(1, sizeof(spinlock_t), GFP_KERNEL);
     newBuffer->writePosition = 0;
     newBuffer->readPosition = 0;
     newBuffer->user = current_uid().val;
-    
+    newBuffer->alarm = false;
+    pr_info("addNewBuffer(): Initializing spinlock...");
+    spin_lock_init(newBuffer->comparing);
+    pr_info("addNewBuffer(): Spinlock has been initialized successfully!");
     struct buffer* i = fisrtBuffer;
     if (i != NULL) {
         while (i->next != NULL) {
@@ -57,60 +65,71 @@ static void addNewBuffer(void) {
         i->next = newBuffer;
     } else {
         fisrtBuffer = newBuffer;
-        pr_info("Now firstBuffer pointer is %s equal NULL", (fisrtBuffer == NULL)?"":"NOT");
-        pr_info("BTW, newBuffer is %s equal NULL", (newBuffer == NULL)?"":"NOT");
+        pr_info("Now firstBuffer pointer is %sequal NULL", (fisrtBuffer == NULL)?"":"NOT ");
+        pr_info("BTW, newBuffer is %sequal NULL", (newBuffer == NULL)?"":"NOT ");
     }
     pr_info("addNewBuffer(): new buffer for user id:%d has been created", newBuffer->user);
 }
 
 static struct buffer* searchBufferByID(uid_t searchID) {
     struct buffer* result = fisrtBuffer;
-    pr_info("searchBufferByID(%d): searching buffer for userID:%d...", searchID, searchID);
+    //pr_info("searchBufferByID(%d): searching buffer for userID:%d...", searchID, searchID);
     if (result != NULL) {
         while (result != NULL) {
-            pr_info("searchBufferByID(%d): i see buffer for userID:%d", searchID, result->user);
-            if (result->user == searchID)
+            //pr_info("searchBufferByID(%d): found for userID:%d", searchID, result->user);
+            if (result->user == searchID) {
+                //pr_info("searchBufferByID(%d): returned buffer userID:%d", searchID, result->user);
                 return result;
+            }
             else 
                 result = result->next;
         }
+        //pr_info("searchBufferByID(%d): didn't find for userID:%d", searchID);
         return result;
     } else {
+        //pr_info("searchBufferByID(%d): anyone buffer hadn't been created", searchID);
         return result;
     }
 }
 
 //---------------------------------------------------------------------------
  static bool isBufferEmpty(struct buffer* buf) {
-    if (buf->readPosition == buf->writePosition)
-        return true;
-    else
+    if (buf->readPosition == buf->writePosition) {
+        return true; 
+    } else {
         return false;
+    }
 }
 
 static bool isBufferFull(struct buffer* buf) {
     if ((buf->writePosition == buf->readPosition - 1) ||
         ((buf->writePosition == sizeOfBuffer - 1) &&
-         (buf->readPosition == 0)))
+         (buf->readPosition == 0))) {
         return true;
-    else
+    } else {
         return false;
+    }
 }
 //----------------------------------------------------------------------------
 
 static int my_open(struct inode *i, struct file *f) {
+    printk(KERN_INFO "Driver: open(uid: %d)\n", current_uid().val);
     uid_t user = current_uid().val;
     if (searchBufferByID(user) == NULL) {
-        pr_info("searchByID(%d): havn't found user's buffer", user);
+        pr_info("Open(): havn't found user's buffer");
         addNewBuffer();
     }
-
-	printk(KERN_INFO "Driver: open(uid: %d)\n", current_uid().val);
+    searchBufferByID(user)->countOfOpening++;
   	return 0;
 }
 
 static int my_close(struct inode *i, struct file *f) {
 	printk(KERN_INFO "Driver: close(uid: %d)\n", current_uid().val);
+    searchBufferByID(current_uid().val)->countOfOpening--;
+    printk("Close(): hey, i checked that isBufferEmpty() = %s", 
+                    isBufferEmpty(searchBufferByID(current_uid().val)) ? "true" : "false");
+    searchBufferByID(current_uid().val)->alarm = true;
+    wake_up_interruptible(&queueForRead);
   	return 0;
 }
 //----------------------------------------------------------------------------
@@ -126,35 +145,70 @@ static ssize_t my_read(struct file *f,		// path to the device
         return 0;
     }
     mutex_lock(&currentBuffer->readingMutex);
-	printk(KERN_INFO "Driver: read(length: %ld, uid: %d)\n", len, current_uid().val);
+	printk(KERN_INFO "Driver: start read(length: %ld, uid: %d)\n", len, current_uid().val);
     char* blockOfKernelMemory = (char*)kcalloc(len, sizeof(char), GFP_KERNEL);
     if (blockOfKernelMemory == NULL) {
         goto readexit;
     }
-    if (isBufferEmpty(currentBuffer)) {
+   /* if (isBufferEmpty(currentBuffer)) {
         goto readexit;                      // stop work cause the buffer is empty
-    } else {
+    } else {*/
 	    while (countOfReadedBytes != len) {
-		    if (isBufferEmpty(currentBuffer)) {          // if the buffer is empty go sleep
-		    	wait_event_interruptible(queueForRead, !isBufferEmpty(currentBuffer));
-		    }
+            spin_lock(currentBuffer->comparing);
+            if ((currentBuffer->countOfOpening < 2)&&(isBufferEmpty(currentBuffer))) {
+                //pr_info("read(): flag 5");
+                spin_unlock(currentBuffer->comparing);
+                //pr_info("read(): flag 6");
+                goto readeof;
+            }
+            spin_unlock(currentBuffer->comparing);
             blockOfKernelMemory[countOfReadedBytes] = currentBuffer->memory[currentBuffer->readPosition];
-            printk(KERN_INFO "buffer: read(wrPos: %d, readPos: %d)\n", 
+           /* printk(KERN_INFO "buffer: read(wrPos: %d, readPos: %d, done: %d, remained: %d, byte: %c)\n", 
                                         currentBuffer->writePosition,
-                                        currentBuffer->readPosition);
+                                        currentBuffer->readPosition,
+                                        countOfReadedBytes,
+                                        len - countOfReadedBytes,
+                                        blockOfKernelMemory[countOfReadedBytes]);*/
+            
+            /*if (blockOfKernelMemory[countOfReadedBytes] == '\0') {
+                goto readeof;
+            }*/
             countOfReadedBytes++;
-		    if (currentBuffer->readPosition == sizeOfBuffer - 1) {
+            spin_lock(currentBuffer->comparing);
+            if (currentBuffer->readPosition == sizeOfBuffer - 1) {
                 currentBuffer->readPosition = 0;
             } else {
                 currentBuffer->readPosition++;
             }
             wake_up_interruptible(&queueForWrite);
+            if (isBufferEmpty(currentBuffer)) {
+                if (currentBuffer->countOfOpening < 2) {
+                   // pr_info("read(): flag 14");
+                    spin_unlock(currentBuffer->comparing);
+                    //pr_info("read(): flag 15");
+                    goto readeof;
+                }
+                //pr_info("read(): flag 16");
+                spin_unlock(currentBuffer->comparing);
+		    	//pr_info("read(): flag 17");
+                wait_event_interruptible(queueForRead, !isBufferEmpty(currentBuffer)||(currentBuffer->alarm == true));
+                currentBuffer->alarm = false;
+                //pr_info("read(): flag 18");  
+		    } else {
+                spin_unlock(currentBuffer->comparing);
+            }            
         }
+readeof:    pr_alert("buffer: read(wrPos: %d, readPos: %d, done: %d, remained: %d)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition,
+                                        countOfReadedBytes,
+                                        len - countOfReadedBytes);
         copy_to_user(buf, blockOfKernelMemory, countOfReadedBytes);
 readexit:   kfree(blockOfKernelMemory);
         mutex_unlock(&currentBuffer->readingMutex);
+    //    pr_info("read(): flag 21");
         return countOfReadedBytes;
-    }
+   /* }*/
 }
 
 static ssize_t my_write(struct file *f,		// path to the device
@@ -180,23 +234,50 @@ static ssize_t my_write(struct file *f,		// path to the device
 	} else {
         copy_from_user(blockOfKernelMemory, buf, len);
         while (countOfWrittenBytes != len) {
-            if (isBufferFull(currentBuffer)) {
-                wait_event_interruptible(queueForWrite, !isBufferFull(currentBuffer));
-            }
-            printk(KERN_INFO "buffer: write(wrPos: %d, readPos: %d)\n", 
-                                        currentBuffer->writePosition,
-                                        currentBuffer->readPosition);
+            
             currentBuffer->memory[currentBuffer->writePosition] = blockOfKernelMemory[countOfWrittenBytes];
             countOfWrittenBytes++;
+            
+           /* printk(KERN_INFO "buffer: written(wrPos: %d, readPos: %d, done: %d, remained: %d, byte: %c)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition,
+                                        countOfWrittenBytes,
+                                        len - countOfWrittenBytes,
+                                        currentBuffer->memory[currentBuffer->writePosition]);*/
+            //if (blockOfKernelMemory[countOfWrittenBytes - 1] == '\0') 
+            //    break;
+            spin_lock(currentBuffer->comparing);
             if (currentBuffer->writePosition == sizeOfBuffer - 1) {
                 currentBuffer->writePosition = 0;
             } else {
                 currentBuffer->writePosition++;
             }
             wake_up_interruptible(&queueForRead);
+            if (isBufferFull(currentBuffer)) {
+                spin_unlock(currentBuffer->comparing);  
+                wait_event_interruptible(queueForWrite, !isBufferFull(currentBuffer));
+                
+            } else { 
+                spin_unlock(currentBuffer->comparing);
+            }
         }
+        wake_up_interruptible(&queueForRead);
+        printk(KERN_ALERT "buffer: written(wrPos: %d, readPos: %d, done: %d, remained: %d)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition,
+                                        countOfWrittenBytes,
+                                        len - countOfWrittenBytes);
+       /* currentBuffer->memory[currentBuffer->writePosition] = '\0';
+        printk(KERN_INFO "buffer: LAST written(wrPos: %d, readPos: %d, done: %d, remained: %d, byte: %c)\n", 
+                                        currentBuffer->writePosition,
+                                        currentBuffer->readPosition,
+                                        countOfWrittenBytes,
+                                        len - countOfWrittenBytes,
+                                        currentBuffer->memory[currentBuffer->writePosition]);*/
+        
 writeexit:  kfree(blockOfKernelMemory);
         mutex_unlock(&currentBuffer->writingMutex);
+        wake_up_interruptible(&queueForRead);
         return countOfWrittenBytes;
 	}
 }
