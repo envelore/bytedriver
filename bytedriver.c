@@ -12,6 +12,7 @@
 #include <linux/cred.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/ioctl.h>
 
 
 static dev_t first; 			// Global variable for the first device number
@@ -21,8 +22,8 @@ static DECLARE_WAIT_QUEUE_HEAD(queueForRead);
 static DECLARE_WAIT_QUEUE_HEAD(queueForWrite);
 
 //---------------------------------------------------------------------------
-static int sizeOfBuffer = 20;	            // parametric size of the buffer
-module_param(sizeOfBuffer, int, 0); 
+static int sizeOfNewBuffer = 20;	            // parametric size of the buffer
+module_param(sizeOfNewBuffer, int, 0); 
 
 struct buffer {
     char* memory;
@@ -35,6 +36,7 @@ struct buffer {
     int countOfOpening;
     spinlock_t* comparing;
     bool alarm;
+    int sizeOfBuffer;
 };
 
 static struct buffer* fisrtBuffer = NULL;
@@ -44,12 +46,13 @@ static void addNewBuffer(void) {
     if (newBuffer == NULL) {
         pr_info("addNewBuffer(): havn't got memory for buffer");
     }
-    newBuffer->memory = (char*)kcalloc(sizeOfBuffer, sizeof(char), GFP_KERNEL);
+    newBuffer->memory = (char*)kcalloc(sizeOfNewBuffer, sizeof(char), GFP_KERNEL);
     if (newBuffer->memory == NULL) {
         kfree(newBuffer);
         pr_info("addNewBuffer(): havn't got memory for buffer memory");
     }
     newBuffer->comparing = (spinlock_t*)kcalloc(1, sizeof(spinlock_t), GFP_KERNEL);
+    newBuffer->sizeOfBuffer = sizeOfNewBuffer;
     newBuffer->writePosition = 0;
     newBuffer->readPosition = 0;
     newBuffer->user = current_uid().val;
@@ -68,7 +71,8 @@ static void addNewBuffer(void) {
         pr_info("Now firstBuffer pointer is %sequal NULL", (fisrtBuffer == NULL)?"":"NOT ");
         pr_info("BTW, newBuffer is %sequal NULL", (newBuffer == NULL)?"":"NOT ");
     }
-    pr_info("addNewBuffer(): new buffer for user id:%d has been created", newBuffer->user);
+    pr_info("addNewBuffer(): new buffer for user id:%d has been created, size = %d", newBuffer->user,
+                                                                            newBuffer->sizeOfBuffer);
 }
 
 static struct buffer* searchBufferByID(uid_t searchID) {
@@ -103,7 +107,7 @@ static struct buffer* searchBufferByID(uid_t searchID) {
 
 static bool isBufferFull(struct buffer* buf) {
     if ((buf->writePosition == buf->readPosition - 1) ||
-        ((buf->writePosition == sizeOfBuffer - 1) &&
+        ((buf->writePosition == buf->sizeOfBuffer - 1) &&
          (buf->readPosition == 0))) {
         return true;
     } else {
@@ -111,6 +115,22 @@ static bool isBufferFull(struct buffer* buf) {
     }
 }
 //----------------------------------------------------------------------------
+
+static long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
+    struct buffer* currentBuffer = searchBufferByID(current_uid().val);
+    if (currentBuffer == NULL) {
+        printk(KERN_INFO "ioctl(): PROBLEMZ WITH BUFFER POINTER, EXITED, SIR");
+        return -ENOTTY;
+    }
+    if(cmd != 17) {
+        printk(KERN_INFO "ioctl(): em, it's wrong cmd...");
+        return -ENOTTY;
+    } else {
+        sizeOfNewBuffer = (int)arg;
+        printk(KERN_INFO "ioctl(): hey, i've changed sizeOfNewBuffer = %d", sizeOfNewBuffer);
+        return 0;
+    } 
+} 
 
 static int my_open(struct inode *i, struct file *f) {
     printk(KERN_INFO "Driver: open(uid: %d)\n", current_uid().val);
@@ -175,7 +195,7 @@ static ssize_t my_read(struct file *f,		// path to the device
             }*/
             countOfReadedBytes++;
             spin_lock(currentBuffer->comparing);
-            if (currentBuffer->readPosition == sizeOfBuffer - 1) {
+            if (currentBuffer->readPosition == currentBuffer->sizeOfBuffer - 1) {
                 currentBuffer->readPosition = 0;
             } else {
                 currentBuffer->readPosition++;
@@ -247,7 +267,7 @@ static ssize_t my_write(struct file *f,		// path to the device
             //if (blockOfKernelMemory[countOfWrittenBytes - 1] == '\0') 
             //    break;
             spin_lock(currentBuffer->comparing);
-            if (currentBuffer->writePosition == sizeOfBuffer - 1) {
+            if (currentBuffer->writePosition == currentBuffer->sizeOfBuffer - 1) {
                 currentBuffer->writePosition = 0;
             } else {
                 currentBuffer->writePosition++;
@@ -293,7 +313,8 @@ writeexit:  kfree(blockOfKernelMemory);
     .open = my_open,
     .release = my_close,
     .read = my_read,
-    .write = my_write
+    .write = my_write,
+    .unlocked_ioctl = my_ioctl
 };
 
 static int __init envelore_init(void) /* Constructor */
